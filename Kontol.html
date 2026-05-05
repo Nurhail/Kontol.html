@@ -1,0 +1,251 @@
+const express = require('express');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+app.use(express.json());
+app.use(express.static('public'));
+
+// Database sederhana (gunakan Redis/MySQL untuk production)
+const scripts = new Map();
+const userWhitelist = new Map();
+const accessLogs = [];
+
+// Generate random ID
+function generateId() {
+    return crypto.randomBytes(16).toString('hex');
+}
+
+// Encrypt script dengan AES
+function encryptScript(content, key) {
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(key, 'hex'), iv);
+    let encrypted = cipher.update(content, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return {
+        iv: iv.toString('hex'),
+        data: encrypted
+    };
+}
+
+// Decrypt script
+function decryptScript(encryptedData, key) {
+    const decipher = crypto.createDecipheriv(
+        'aes-256-cbc', 
+        Buffer.from(key, 'hex'), 
+        Buffer.from(encryptedData.iv, 'hex')
+    );
+    let decrypted = decipher.update(encryptedData.data, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+}
+
+// Middleware untuk validasi akses
+function validateAccess(req, res, next) {
+    const apiKey = req.headers['x-api-key'];
+    const scriptId = req.params.id;
+    const clientIp = req.ip;
+    const userAgent = req.headers['user-agent'];
+    
+    const script = scripts.get(scriptId);
+    if (!script) {
+        return res.status(404).send('Script not found');
+    }
+    
+    // Validasi API key
+    if (!apiKey || apiKey !== script.apiKey) {
+        accessLogs.push({
+            scriptId,
+            clientIp,
+            userAgent,
+            status: 'DENIED',
+            time: new Date()
+        });
+        return res.status(403).send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Access Denied - Junkie Clone</title>
+                <style>
+                    body {
+                        font-family: monospace;
+                        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                        color: #ff6b6b;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        height: 100vh;
+                        margin: 0;
+                        text-align: center;
+                    }
+                    .container {
+                        background: rgba(0,0,0,0.8);
+                        padding: 40px;
+                        border-radius: 10px;
+                        border-left: 4px solid #ff6b6b;
+                    }
+                    h1 { font-size: 48px; margin-bottom: 20px; }
+                    .domain { color: #ffd93d; font-size: 20px; }
+                    button {
+                        background: #ff6b6b;
+                        color: white;
+                        border: none;
+                        padding: 10px 20px;
+                        margin: 10px;
+                        cursor: pointer;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🔒 ACCESS DENIED</h1>
+                    <div class="domain">api.junkie-clone.com</div>
+                    <p>This lua script is protected by Junkie Clone Protection</p>
+                    <p>You don't have permission to access these files.</p>
+                    <button onclick="history.back()">Return Home</button>
+                    <button onclick="alert('Contact: admin@junkie-clone.com')">Contact Support</button>
+                </div>
+            </body>
+            </html>
+        `);
+    }
+    
+    // Cek whitelist (opsional)
+    if (script.whitelist && script.whitelist.length > 0) {
+        if (!script.whitelist.includes(apiKey)) {
+            return res.status(403).send('Your key is not whitelisted for this script');
+        }
+    }
+    
+    accessLogs.push({
+        scriptId,
+        clientIp,
+        userAgent,
+        status: 'GRANTED',
+        time: new Date()
+    });
+    
+    next();
+}
+
+// ============ API ENDPOINTS ============
+
+// 1. Upload script (untuk developer)
+app.post('/api/upload', (req, res) => {
+    const { scriptContent, scriptName, password } = req.body;
+    
+    // Password proteksi (ganti dengan password Anda)
+    if (password !== 'YourSecretPassword123') {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    const scriptId = generateId();
+    const apiKey = generateId();
+    const encryptionKey = crypto.randomBytes(32).toString('hex');
+    
+    // Encrypt script
+    const encrypted = encryptScript(scriptContent, encryptionKey);
+    
+    scripts.set(scriptId, {
+        name: scriptName,
+        content: encrypted,
+        apiKey: apiKey,
+        encryptionKey: encryptionKey,
+        createdAt: new Date(),
+        whitelist: [] // bisa diisi dengan user ID
+    });
+    
+    res.json({
+        success: true,
+        scriptId: scriptId,
+        apiKey: apiKey,
+        url: `https://yourdomain.com/api/script/${scriptId}`,
+        loaderExample: `loadstring(game:HttpGet("https://yourdomain.com/api/script/${scriptId}", {headers = {["X-API-Key"]="${apiKey}"}}))()`
+    });
+});
+
+// 2. Download script (untuk end user)
+app.get('/api/script/:id', validateAccess, (req, res) => {
+    const script = scripts.get(req.params.id);
+    
+    // Decrypt sebelum dikirim
+    const decrypted = decryptScript(script.content, script.encryptionKey);
+    
+    // Bungkus dengan obfuscator sederhana
+    const wrappedScript = `
+-- Protected by Junkie Clone v1.0
+-- Authorized access only
+do
+    local _0x3f2a = "${Buffer.from(decrypted).toString('base64')}"
+    local _9d1e = function(s)
+        return loadstring(game:HttpGet("https://yourdomain.com/api/decode", {
+            headers = {["X-Data"]=s}
+        }))()
+    end
+    _9d1e(_0x3f2a)
+end
+`;
+    
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(wrappedScript);
+});
+
+// 3. Decode endpoint (server-side decode)
+app.post('/api/decode', (req, res) => {
+    const encoded = req.headers['x-data'];
+    if (!encoded) return res.status(400).send('No data');
+    
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    res.send(decoded);
+});
+
+// 4. Whitelist management
+app.post('/api/whitelist/:id', (req, res) => {
+    const { scriptId, userId, password } = req.body;
+    
+    if (password !== 'YourSecretPassword123') {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    const script = scripts.get(scriptId);
+    if (!script) return res.status(404).json({ error: 'Script not found' });
+    
+    if (!script.whitelist.includes(userId)) {
+        script.whitelist.push(userId);
+    }
+    
+    res.json({ success: true, whitelist: script.whitelist });
+});
+
+// 5. Dashboard untuk melihat log
+app.get('/api/logs', (req, res) => {
+    const { password } = req.query;
+    if (password !== 'YourSecretPassword123') {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    res.json(accessLogs);
+});
+
+// 6. Revoke akses
+app.post('/api/revoke/:id', (req, res) => {
+    const { scriptId, password } = req.body;
+    
+    if (password !== 'YourSecretPassword123') {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    const script = scripts.get(scriptId);
+    if (script) {
+        scripts.delete(scriptId);
+        res.json({ success: true, message: 'Script revoked' });
+    } else {
+        res.status(404).json({ error: 'Script not found' });
+    }
+});
+
+const PORT = 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Junkie Clone Server running on port ${PORT}`);
+});
